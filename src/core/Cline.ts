@@ -103,6 +103,8 @@ export class Cline {
 	private didAlreadyUseTool = false
 	private didCompleteReadingStream = false
 	private slackThreadTs?: string
+	private slackWatcherInterval?: NodeJS.Timeout
+	private lastProcessedMessageTs?: string
 
 	constructor(
 		provider: ClineProvider,
@@ -640,6 +642,58 @@ export class Cline {
 		}
 	}
 
+	// スレッドの返信を監視する関数
+	private async watchThreadReplies() {
+		if (!this.slackThreadTs) return;
+
+		try {
+			const mcpSettings = await this.providerRef.deref()?.mcpHub?.getMcpSettingsFilePath()
+			const settingsContent = await fs.readFile(mcpSettings!, 'utf-8')
+			const settings = JSON.parse(settingsContent)
+			const channelId = settings.mcpServers.slack.env.SLACK_DEFAULT_CHANNEL_ID
+
+			const response = await this.providerRef
+				.deref()
+				?.mcpHub?.callTool(
+					"slack",
+					"slack_get_thread_replies",
+					{
+						channel_id: channelId,
+						thread_ts: this.slackThreadTs
+					}
+				)
+
+			// レスポンスからメッセージを取得
+			const textContent = response?.content?.find(item => item.type === "text")
+			if (textContent && 'text' in textContent) {
+				try {
+					const jsonResult = JSON.parse(textContent.text)
+					if (jsonResult.ok && jsonResult.messages) {
+						// 最新のメッセージを取得
+						const latestMessage = jsonResult.messages[jsonResult.messages.length - 1]
+						if (latestMessage && latestMessage.text) {
+							const text = latestMessage.text.trim()
+							
+							// コマンドを処理
+							if (text.startsWith('/approve')) {
+								await this.handleWebviewAskResponse("yesButtonClicked")
+							} else if (text.startsWith('/reject')) {
+								await this.handleWebviewAskResponse("noButtonClicked")
+							} else {
+								// 通常の返信を処理
+								await this.handleWebviewAskResponse("messageResponse", text)
+							}
+						}
+					}
+				} catch (e) {
+					console.error("Failed to parse Slack response:", e)
+				}
+			}
+		} catch (error) {
+			console.error("Failed to watch thread replies:", error)
+		}
+	}
+
 	async say(type: ClineSay, text?: string, images?: string[], partial?: boolean): Promise<undefined> {
 		if (this.abort) {
 			throw new Error("Cline instance aborted")
@@ -676,6 +730,8 @@ export class Cline {
 								if (jsonResult.ok && jsonResult.ts) {
 									this.slackThreadTs = jsonResult.ts
 									console.log("Slack thread timestamp saved:", this.slackThreadTs)
+									// スレッドの監視を開始
+									this.startThreadWatcher()
 								}
 							} catch (e) {
 								console.error("Failed to parse Slack response:", e)
@@ -3236,5 +3292,87 @@ export class Cline {
 		}
 
 		return `<environment_details>\n${details.trim()}\n</environment_details>`
+	}
+
+	// スレッドの監視を開始
+	private startThreadWatcher() {
+		if (this.slackWatcherInterval) {
+			clearInterval(this.slackWatcherInterval)
+		}
+
+		// 3秒ごとにスレッドをチェック
+		this.slackWatcherInterval = setInterval(() => {
+			this.checkThreadReplies()
+		}, 3000)
+	}
+
+	// スレッドの監視を停止
+	private stopThreadWatcher() {
+		if (this.slackWatcherInterval) {
+			clearInterval(this.slackWatcherInterval)
+			this.slackWatcherInterval = undefined
+		}
+	}
+
+	// スレッドの返信をチェックする関数
+	private async checkThreadReplies() {
+		if (!this.slackThreadTs) return;
+
+		try {
+			const mcpSettings = await this.providerRef.deref()?.mcpHub?.getMcpSettingsFilePath()
+			const settingsContent = await fs.readFile(mcpSettings!, 'utf-8')
+			const settings = JSON.parse(settingsContent)
+			const channelId = settings.mcpServers.slack.env.SLACK_DEFAULT_CHANNEL_ID
+
+			const response = await this.providerRef
+				.deref()
+				?.mcpHub?.callTool(
+					"slack",
+					"slack_get_thread_replies",
+					{
+						channel_id: channelId,
+						thread_ts: this.slackThreadTs
+					}
+				)
+
+			// レスポンスからメッセージを取得
+			const textContent = response?.content?.find(item => item.type === "text")
+			if (textContent && 'text' in textContent) {
+				try {
+					const jsonResult = JSON.parse(textContent.text)
+					if (jsonResult.ok && jsonResult.messages) {
+						// 新しいメッセージを時系列順に処理
+						for (const message of jsonResult.messages) {
+							// 未処理のメッセージのみを処理
+							if (message.ts && (!this.lastProcessedMessageTs || message.ts > this.lastProcessedMessageTs)) {
+								const text = message.text.trim()
+								
+								// コマンドを処理
+								if (text.startsWith('/approve')) {
+									await this.handleWebviewAskResponse("yesButtonClicked")
+								} else if (text.startsWith('/reject')) {
+									await this.handleWebviewAskResponse("noButtonClicked")
+								} else {
+									// 通常の返信を処理
+									await this.handleWebviewAskResponse("messageResponse", text)
+								}
+
+								this.lastProcessedMessageTs = message.ts
+							}
+						}
+					}
+				} catch (e) {
+					console.error("Failed to parse Slack response:", e)
+				}
+			}
+		} catch (error) {
+			console.error("Failed to check thread replies:", error)
+		}
+	}
+
+	// タスク終了時に監視を停止
+	private async finishTask() {
+		this.stopThreadWatcher()
+		// ... 他の終了処理 ...
 	}
 }
