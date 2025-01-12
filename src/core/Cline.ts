@@ -102,6 +102,7 @@ export class Cline {
 	private didRejectTool = false
 	private didAlreadyUseTool = false
 	private didCompleteReadingStream = false
+	private slackThreadTs?: string
 
 	constructor(
 		provider: ClineProvider,
@@ -621,11 +622,86 @@ export class Cline {
 		this.askResponseImages = images
 	}
 
+	// Slackに送信するメッセージをクリーンアップする関数
+	private cleanupMessageForSlack(text: string): string {
+		try {
+			// JSONっぽい文字列を除去
+			if (text.startsWith("{") && text.endsWith("}")) {
+				return ""
+			}
+			// "Loading..."を除去
+			text = text.replace("Loading...", "")
+			// 空白行を除去
+			text = text.split('\n').filter(line => line.trim()).join('\n')
+			return text.trim()
+		} catch (error) {
+			console.error("Failed to cleanup message for Slack:", error)
+			return text
+		}
+	}
+
 	async say(type: ClineSay, text?: string, images?: string[], partial?: boolean): Promise<undefined> {
 		if (this.abort) {
 			throw new Error("Cline instance aborted")
 		}
 
+		// 完了メッセージをSlackに送信
+		if (text && !partial) {
+			try {
+				const cleanedText = this.cleanupMessageForSlack(text)
+				if (cleanedText) {
+					const mcpSettings = await this.providerRef.deref()?.mcpHub?.getMcpSettingsFilePath()
+					const settingsContent = await fs.readFile(mcpSettings!, 'utf-8')
+					const settings = JSON.parse(settingsContent)
+					const channelId = settings.mcpServers.slack.env.SLACK_DEFAULT_CHANNEL_ID
+
+					// スレッドが存在しない場合は新規メッセージを送信
+					if (!this.slackThreadTs) {
+						const response = await this.providerRef
+							.deref()
+							?.mcpHub?.callTool(
+								"slack",
+								"slack_post_message",
+								{
+									channel_id: channelId,
+									text: cleanedText
+								}
+							)
+
+						// レスポンスからタイムスタンプを取得
+						const textContent = response?.content?.find(item => item.type === "text")
+						if (textContent && 'text' in textContent) {
+							try {
+								const jsonResult = JSON.parse(textContent.text)
+								if (jsonResult.ok && jsonResult.ts) {
+									this.slackThreadTs = jsonResult.ts
+									console.log("Slack thread timestamp saved:", this.slackThreadTs)
+								}
+							} catch (e) {
+								console.error("Failed to parse Slack response:", e)
+							}
+						}
+					} else {
+						// 既存のスレッドに返信
+						await this.providerRef
+							.deref()
+							?.mcpHub?.callTool(
+								"slack",
+								"slack_reply_to_thread",
+								{
+									channel_id: channelId,
+									thread_ts: this.slackThreadTs,
+									text: cleanedText
+								}
+							)
+					}
+				}
+			} catch (error) {
+				console.error("Failed to send message to Slack:", error)
+			}
+		}
+
+		// 既存のWebView処理
 		if (partial !== undefined) {
 			const lastMessage = this.clineMessages.at(-1)
 			const isUpdatingPreviousPartial =
@@ -659,18 +735,16 @@ export class Cline {
 				if (isUpdatingPreviousPartial) {
 					// this is the complete version of a previously partial message, so replace the partial with the complete version
 					this.lastMessageTs = lastMessage.ts
-					// lastMessage.ts = sayTs
 					lastMessage.text = text
 					lastMessage.images = images
 					lastMessage.partial = false
 
 					// instead of streaming partialMessage events, we do a save and post like normal to persist to disk
-					await this.saveClineMessages()
-					// await this.providerRef.deref()?.postStateToWebview()
-					await this.providerRef.deref()?.postMessageToWebview({
-						type: "partialMessage",
-						partialMessage: lastMessage,
-					}) // more performant than an entire postStateToWebview
+						await this.saveClineMessages()
+						await this.providerRef.deref()?.postMessageToWebview({
+							type: "partialMessage",
+							partialMessage: lastMessage,
+						})
 				} else {
 					// this is a new partial=false message, so add it like normal
 					const sayTs = Date.now()
